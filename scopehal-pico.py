@@ -38,27 +38,51 @@ class SCPIServer:
             client, addr = self.control_sock.accept()
             #client.settimeout(1000)
             print(f"Control: Connected with {addr[0]}:{str(addr[1])}")
-            try:
-                while True:
-                    data = client.recv(1024).decode("UTF-8")
-                    if len(data) > 0:
-                        print(data)
-                    else:
-                        raise Exception("empty command")
-                    if "IDN?" in data:
-                        client.send(bytes("Hantek,Hantek6xx4B,0001,0.1\n", "UTF-8"))
-                    elif "CHANS?" in data:
-                        client.send(bytes("4\n", "UTF-8"))
-                    elif "GAIN?" in data:
-                        client.send(bytes("1\n", "UTF-8"))
-                    elif "OFFS?" in data:
-                        client.send(bytes("0\n", "UTF-8"))
-                    else:
-                        client.send(b"")
-            except Exception as e:
-                print(e)
-                print("Control: Disconnect")
-                client.close()
+            in_buff = b""
+            while True:
+                try:
+                    #data = client.recv(1024).decode("UTF-8")
+                    data = client.makefile().readline()
+                except Exception as e:
+                    print(e)
+                    print("Control: Disconnect")
+                    client.close()
+                if len(data) < 1:
+                    break
+
+                cmd = data.split()
+                multi_cmd = cmd[0].split(":")
+                print(cmd, multi_cmd)
+
+                # Get
+                if "IDN?" in data:
+                    client.send(bytes("Hantek,Hantek6xx4B,0001,0.1\n", "UTF-8"))
+                elif "CHANS?" in data:
+                    client.send(bytes("4\n", "UTF-8"))
+                elif "RATES?" in data:
+                    rates = ",".join(map(str,self.hantek.get_rates()))
+                    print(rates)
+                    client.send(bytes(rates+"\n", "UTF-8"))
+                elif "DEPTHS?" in data:
+                    client.send(bytes("4096\n", "UTF-8"))
+                elif "GAIN?" in data:
+                    client.send(bytes("1\n", "UTF-8"))
+                elif "OFFS?" in data:
+                    client.send(bytes("0\n", "UTF-8"))
+
+                # Set
+                elif "RATE" == cmd[0]:
+                    rate = int(cmd[1])
+                    self.hantek.set_rate(rate)
+
+                elif len(multi_cmd) > 1:
+                    if multi_cmd[0] == "TRIG":
+                        if multi_cmd[1] == "LEV":
+                            level = float(cmd[1])
+                            print("setting trigger level", level)
+                            self.hantek.set_trigger_level(level)
+                else:
+                    client.send(b"")
 
     def _waveform_thread(self):
         while True:
@@ -67,22 +91,34 @@ class SCPIServer:
             try:
                 while True:
                     data = self.hantek.read_buffer()
+                    rate = self.hantek.get_rate()
+                    fs_per_sample = int((10**15) / rate)
                     # uint16_t numChannels; int64_t fs_per_sample;
-                    sample_hdr = struct.pack("<Hq", len(data), 500*1000*1000*1000)
+                    sample_hdr = struct.pack("<Hq", len(data), fs_per_sample)
                     #print("snd smpl hdr", sample_hdr)
                     client.send(sample_hdr)
                     i = 0
                     for chdata in data:
                         # size_t chnum; size_t memdepth (samples, not bytes); float config[3]; (scale, offset, trigphase)
-                        channel_hdr = struct.pack("<QQfff", i, len(chdata), 1/(2**10), 0, 0)
+                        mx = max(chdata)
+                        mn = min(chdata)
+                        rng = mx-mn
+                        if rng == 0:
+                            rng = 1
+                        scale = 65532/rng
+                        offset = mx - rng/2
+                        trigphase = 0
+                        channel_hdr = struct.pack("<QQfff", i, len(chdata), 1/scale, offset, trigphase)
                         #print("snd chnl hdr", channel_hdr)
                         client.send(channel_hdr)
 
-                        pdata = struct.pack("<"+str(len(chdata))+"h", *[ (element-128) * 64 for element in chdata])
+                        values = [int((element-offset)*scale) for element in chdata]
+                        #print(values)
+                        pdata = struct.pack("<"+str(len(chdata))+"h", *values)
                         #print("snd data", pdata[:20])
                         client.send(pdata)
                         i += 1
-            except Exception as e:
+            except BrokenPipeError as e:
                 print(e)
                 print("Waveform: Disconnect")
                 client.close()

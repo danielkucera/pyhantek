@@ -3,6 +3,7 @@
 import usb.core
 import usb.util
 import time
+import struct
 
 class Hantek:
     def __init__(self):
@@ -41,7 +42,11 @@ class Hantek:
 
         self.setup()
 
-        self.configure()
+        self.samplerate = 1250000
+        self.slope = "rising"
+        self.trigger_voltage = 1 # V
+
+        self.config_wait = True
 
     # USB communication
     def ctrl(self, rtype, req, data, error=None, wValue=0):
@@ -115,6 +120,7 @@ class Hantek:
     
         time.sleep(0.002)
     
+        # init ADC start
         # 67 j2390 STATIC
         self.bwrite(b"\x08\x00\x00\x65\x00\x30\x02\x00")
     
@@ -124,28 +130,114 @@ class Hantek:
         self.bwrite(b"\x08\x00\x00\x28\xf1\x0f\x02\x00")
     
         time.sleep(0.015)
+
+        # init ADC end
     
         # 79 j2400
         self.bwrite(b"\x08\x00\x00\x12\x38\x01\x02\x00")
 
+    def config_trigger_x_offset(self):
+        # TRIGGER OFFSET m356a triggerXPos something
+        offset_raw1 = 214828
+        offset_raw2 = 205600
+        or1lo = offset_raw1 & 0xffffffff
+        or2lo = offset_raw2 & 0xffffffff
+        or1hi = (offset_raw1 >> 32) & 0xffff
+        or2hi = (offset_raw2 >> 32) & 0xffff
+        offset_cmd = struct.pack("<BBIHIH", 0x10, 0x00, or1lo , or1hi, or2lo, or2hi)
+        self.bwrite(offset_cmd)
+        #self.bwrite(b"\x10\x00\x2c\x47\x03\x00\x00\x00\x20\x23\x03\x00\x00\x00")
+
+    def config_timebase(self):
+        # mo13046a dole timebase? 0f00 4b
+        # 2us - 0x00; 5us - 0x01; 10us - 0x04; 20us - 0x09; 50us - 0x18 (24); 100us - 0x31 (49); 200us - 0x63 (99)
+        timebase_raw = ( 250*10**6 // self.samplerate )//2 - 1
+        if timebase_raw < 0:
+            timebase_raw = 1250000
+        timebase_cmd = struct.pack("<BBI", 0x0f, 0x00, timebase_raw)
+        self.bwrite(timebase_cmd)
+        #self.bwrite(b"\x0f\x00\x63\x00\x00\x00")
+
+    def config_trigger_slope(self):
+        # mo13043a trigger slope 1100 (00 b) 0100
+        if self.slope == "rising":
+            slope_raw = 0
+        else:
+            slope_raw = 1
+        slope_cmd = struct.pack("<BBBBBB", 0x11, 0x00, 0 , slope_raw, 0, 0)
+        self.bwrite(slope_cmd)
+        #self.bwrite(b"\x11\x00\x00\x00\x01\x00")
+
+    def config_trigger_level(self):
+        delta = 4
+        channel_offset = 1 # V
+        v_per_div = 0.5
+        full_scale = 8 * v_per_div
+        trigger_pos = (self.trigger_voltage + channel_offset) / full_scale 
+        #middle = (trigger_pos * 200)/256 + 28.5 TODO: check android
+        middle = (trigger_pos * 200) + 28.5
+        lo = middle - delta 
+        hi = middle + delta
+        if lo < 0:
+            lo = 0
+        if lo > 228:
+            lo = 228
+        if hi < 0:
+            hi = 0
+        if hi > 228:
+            hi = 228
+
+        b  = int(hi) & 0xff
+        b2 = int(lo) & 0xff
+        b3 = int(middle) & 0xff
+
+        print("trigger raw", middle)
+
+        # TRIGGER LEVEL mo13049a {7, 0, b, b, b2, b2, b, b, b2, b2, b, b, b2, b2, b, b, b2, b2, b3, b3, b3, b3, b3, b3, b3, b3}) b3 - trigger level, b + delta, b2 - delta
+        data = [b, b, b2, b2] * 4
+        data += [b3] * 8
+        cmd = struct.pack("<BB24B", 0x07, 0, *data)
+        self.bwrite(cmd)
+        #self.bwrite(b"\x07\x00\x76\x76\x6e\x6e\x76\x76\x6e\x6e\x76\x76\x6e\x6e\x76\x76\x6e\x6e\x72\x72\x72\x72\x72\x72\x72\x72")
+
+    def config_channel_offset(self):
+        # mo13045a CHANNEL OFFSET
+        #off1
+        #off2
+        #off3
+        #off4
+
+        self.bwrite(b"\x1e\x00\x00\x04\x00\x04\x00\x04\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+        #self.bwrite(b"\x1e\x00\x00\x04\x00\x04\x00\x04\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+
+    def config_trigger_source(self):
+        # mo13044a 1200 channels enabled ???
+        trigger_source = 0
+        cmd = struct.pack("<BBBBBB", 0x12, 0x00, 0x3d, 0x00, 0x00, trigger_source)
+        self.bwrite(cmd)
+        #self.bwrite(b"\x12\x00\x3d\x00\x00\x00")
+
     def configure(self):
+        print("configuring")
         #200us 4ch
         # write 0b 0 j4 i2 < mo13055a 100000000 # counter enabled 1 : 3, frequency meter enabled 
         self.bwrite(b"\x0b\x00\x00\xe1\xf5\x05\x03\x00")
         # pcbver & timebase fcion for me: 0x3f (63) - 4ns, 48 - 2ns, 25 - default
         self.bwrite(b"\x08\x00\x00\x3f\x00\x55\x04\x00")
-        # TRIGGER OFFSET m356a triggerXPos something
-        self.bwrite(b"\x10\x00\x2c\x47\x03\x00\x00\x00\x20\x23\x03\x00\x00\x00")
+
+        self.config_trigger_x_offset()
+
         # channel settings? mo13046a -> m361b
         self.bwrite(b"\x08\x00\x00\x10\x08\x3a\x04\x00")
         self.bwrite(b"\x08\x00\x00\x04\x02\x3b\x04\x00")
         self.bwrite(b"\x08\x00\x00\x00\x00\x0f\x04\x00")
         self.bwrite(b"\x08\x00\x00\x04\x02\x31\x04\x00")
         self.bwrite(b"\x08\x00\x00\x50\x55\x2a\x04\x00")
-        # mo13046a dole timebase? 0f00 4b
-        self.bwrite(b"\x0f\x00\x63\x00\x00\x00")
-        # TRIGGER OFFSET m356a 1000 6b 6b 
-        self.bwrite(b"\x10\x00\x2c\x47\x03\x00\x00\x00\x20\x23\x03\x00\x00\x00")
+
+        self.config_timebase()
+
+        self.config_trigger_x_offset()
+
         # 0800 .... 0100 mo13047a
         self.bwrite(b"\x08\x00\x36\x36\x36\x36\x01\x00")
         time.sleep(0.004)
@@ -158,19 +250,23 @@ class Hantek:
         self.bwrite(b"\x08\x00\x00\x00\x00\x0f\x04\x00")
         self.bwrite(b"\x08\x00\x00\x04\x02\x31\x04\x00")
         self.bwrite(b"\x08\x00\x00\x50\x55\x2a\x04\x00")
-        # mo13044a 1200 ????
+
+        self.config_trigger_source()
+
+        # mo13044a 1200 channels enabled
         self.bwrite(b"\x12\x00\x3d\x00\x00\x00")
         # mo13051a [0,1,2,4]00 2b
         self.bwrite(b"\x00\x00\x01\x62")
         self.bwrite(b"\x01\x00\x64\x70")
         self.bwrite(b"\x02\x00\x80\x69")
         self.bwrite(b"\x04\x00\xd9\x72")
-        # mo13045a
-        self.bwrite(b"\x1e\x00\x00\x04\x00\x04\x00\x04\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
-        # TRIGGER LEVEL mo13049a {7, 0, b, b, b2, b2, b, b, b2, b2, b, b, b2, b2, b, b, b2, b2, b3, b3, b3, b3, b3, b3, b3, b3}) b3 - trigger level, b + delta, b2 - delta
-        self.bwrite(b"\x07\x00\x76\x76\x6e\x6e\x76\x76\x6e\x6e\x76\x76\x6e\x6e\x76\x76\x6e\x6e\x72\x72\x72\x72\x72\x72\x72\x72")
-        # mo13043a trigger slope 1100 (00 b) 0100
-        self.bwrite(b"\x11\x00\x00\x00\x01\x00")
+
+        self.config_channel_offset()
+
+        self.config_trigger_level()
+
+        self.config_trigger_slope()
+
         # m308C trigger mode  0300 b 00 : CaptureMode.Roll - set bit 2^1, TriggerSweep.Auto - unset bit 2^0
         #self.bwrite("\x03\x00\x01\x00")
 
@@ -231,6 +327,12 @@ class Hantek:
         return j6
     
     def read_buffer(self):
+        if self.config_wait:
+            self.config_wait = False
+            self.configure()
+
+        time.sleep(0.1)
+
         # 357, 291
         self.bwrite([3, 0, 1, 0])
     
@@ -263,7 +365,7 @@ class Hantek:
         self.bwrite(b"\x0e\x00"+ bytes([ j6 & 255, (j6 >> 8) & 255 ]))
         
         # number of 512B usb packets to send, 0 gives maximum, 1 gives 2, 2 gives 3,...
-        packets = 8
+        packets = 128
         if packets > 0:
             exp_len = (packets)*512
         else:
@@ -282,6 +384,9 @@ class Hantek:
         ch2 = []
         ch3 = []
         ch4 = []
+
+        fullscale = 8
+        offset = 3
     
         for i in range(len(data)//4):
             ch1.append(data[i*4])
@@ -289,6 +394,24 @@ class Hantek:
             ch3.append(data[i*4+2])
             ch4.append(data[i*4+3])
     
-        return [ ch1, ch2, ch3, ch4 ]
+        return [ [ e/(255/fullscale) - offset for e in ch1], ch2, ch3, ch4 ]
 
+    def set_rate(self, rate):
+        if rate > 250000000:
+            return False
+        self.samplerate = rate
+        self.config_wait = True
+
+    def get_rate(self):
+        return self.samplerate
+
+    def get_rates(self):
+        rates = []
+        values = [ 1, 2, 4, 8, 20, 40, 80, 200, 400, 800, 2000, 4000, 8000, 20000, 40000, 80000]
+        rates += [(value)*1000*1000 for value in values] #ns
+        return rates
+
+    def set_trigger_level(self, level):
+        self.trigger_voltage = level
+        self.config_wait = True
 
